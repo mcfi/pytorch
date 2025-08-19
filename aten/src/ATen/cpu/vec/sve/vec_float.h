@@ -32,7 +32,7 @@ struct is_vec_specialized_for<float> : std::bool_constant<true> {};
 template <>
 class Vectorized<float> {
  private:
-    __at_align__ float values[8];
+    __at_align__ float values[2048 / sizeof(float)];
  public:
 
   using value_type = float;
@@ -49,7 +49,7 @@ class Vectorized<float> {
   }
   template<typename T,
            typename = std::enable_if_t<std::is_pointer_v<T>>>
-  inline Vectorized(const float * val) {
+  inline Vectorized(float * val) {
     svst1_f32(ptrue, values, svld1_f32(ptrue, val));
   }
   template<typename... Args,
@@ -90,12 +90,13 @@ class Vectorized<float> {
 
   static inline Vectorized<float> blend(const Vectorized<float>& a, const Vectorized<float>& b, const uint64_t mask) {
     // Build an array of flags: each element is 1 if the corresponding bit in 'mask' is set, 0 otherwise.
-    __at_align__ int32_t flag_arr[size()];
+    __at_align__ int32_t * flag_arr = new int32_t[size()];
     for (int i = 0; i < size(); i++) {
       flag_arr[i] = (mask & (1ULL << i)) ? 1 : 0;
     }
     // Load the flag array into an SVE int32 vector.
     svint32_t int_mask = svld1_s32(ptrue, flag_arr);
+    delete[] flag_arr;
     // Compare each lane of int_mask to 0; returns an svbool_t predicate where true indicates a nonzero flag.
     svbool_t blend_mask = svcmpne_n_s32(ptrue, int_mask, 0);
     // Use svsel to select elements from b where the predicate is true, else from a.
@@ -113,11 +114,13 @@ class Vectorized<float> {
   static inline Vectorized<float> arange(
       float base = 0.f,
       step_t step = static_cast<step_t>(1)) {
-    __at_align__ float buffer[size()];
+    __at_align__ float * buffer = new float[size()];
     for (int64_t i = 0; i < size(); i++) {
       buffer[i] = base + i * step;
     }
-    return Vectorized<float>::from_ptr(buffer);
+    auto tmp = Vectorized<float>::from_ptr(buffer);
+    delete[] buffer;
+    return tmp;
   }
   static inline Vectorized<float> set(
       const Vectorized<float>& a,
@@ -216,7 +219,7 @@ class Vectorized<float> {
   inline int64_t zero_mask() const {
     // returns an integer mask where all zero elements are translated to 1-bit and others are translated to 0-bit
     int64_t mask = 0;
-    __at_align__ int32_t mask_array[size()];
+    __at_align__ int32_t * mask_array = new int32_t[size()];
 
     svbool_t svbool_mask = svcmpeq_f32(ptrue, *this, ZERO_F32);
     svst1_s32(ptrue, mask_array, svsel_s32(svbool_mask,
@@ -225,7 +228,7 @@ class Vectorized<float> {
     for (int64_t j = 0; j < size(); ++j) {
       if (mask_array[j]) mask |= (1ull << j);
     }
-
+    delete[] mask_array;
     return mask;
   }
   inline Vectorized<float> isnan() const {
@@ -300,7 +303,39 @@ class Vectorized<float> {
     return USE_SLEEF(Sleef_expm1fx_u10sve(*this), map(std::expm1));
   }
   inline Vectorized<float> exp_u20() {
-    return exp();
+     // Load values into an SVE vector
+    svfloat32_t val_vec = svld1(svptrue_b32(), values);  // 'values' is float*
+
+    // Check for special case: |x| >= 87.3...
+    svbool_t is_special_case = svacgt(svptrue_b32(), val_vec, 0x1.5d5e2ap+6f);
+    if (svptest_any(svptrue_b32(), is_special_case)) {
+        return exp(); // fallback to scalar exp() for special cases
+    }
+
+    // Constants
+    const svfloat32_t ln2_hi = svdup_f32(0x1.62e4p-1f);    
+    const svfloat32_t ln2_lo = svdup_f32(0x1.7f7d1cp-20f);    
+    const svfloat32_t c1      = svdup_f32(0.5f);    
+    const svfloat32_t inv_ln2 = svdup_f32(0x1.715476p+0f);
+    const svfloat32_t shift_vec = svdup_f32(0x1.803f8p17f);  // scalar to vector
+
+    // n = round(x / ln2)
+    svfloat32_t z = svmad_x(svptrue_b32(), inv_ln2, val_vec, shift_vec);
+    svfloat32_t n = svsub_x(svptrue_b32(), z, shift_vec);
+
+    // r = x - n * ln2
+    svfloat32_t r = svsub_x(svptrue_b32(), val_vec, svmul_x(svptrue_b32(), n, ln2_hi));
+    r = svsub_x(svptrue_b32(), r, svmul_x(svptrue_b32(), n, ln2_lo));
+
+    // scale = 2^(n)
+    svfloat32_t scale = svexpa(svreinterpret_u32(z));
+
+    // poly(r) = exp(r) - 1 ≈ r + 0.5 * r^2
+    svfloat32_t r2 = svmul_x(svptrue_b32(), r, r);
+    svfloat32_t poly = svmla_x(svptrue_b32(), r, r2, c1);
+
+    // return scale * (1 + poly)
+    return svmla_x(svptrue_b32(), scale, scale, poly);
   }
   inline Vectorized<float> fexp_u20() {
     return exp();
