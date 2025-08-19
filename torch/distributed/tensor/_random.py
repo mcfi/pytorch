@@ -2,15 +2,17 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import contextlib
 import warnings
+from logging import getLogger
 from typing import Optional, Union
 
 import torch
-import torch.distributed as dist
 from torch import Tensor
 from torch.distributed.device_mesh import _get_device_handle, DeviceMesh
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Shard
 
+
+logger = getLogger(__name__)
 
 __all__ = [
     "is_rng_supported_mesh",
@@ -178,16 +180,35 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
                 f"CUDA/CUDA-like/XPU device. Got {self._device.type} instead."
             )
 
+        rng_state = self._get_device_state()
+        if run_state_sync:
+            # synchronize RNG state using rank 0's current one
+            torch.distributed.broadcast(rng_state, 0)
+            my_rng_state = self._get_device_state()
+            if not all(my_rng_state == rng_state):
+                logger.warning(
+                    "DTensor is synchronizing RNG states of every rank with the state from rank 0. "
+                    "This behavior is deprecated. "
+                    "Please call `torch.manual_seed()` on every rank that participates in SPMD DTensor Operations with "
+                    "the same seed. If using Pipeline Parallelism, each pipeling state would use a different seed, "
+                    "but all ranks belonging to one pipeline stage would use the same seed."
+                )
+            self._set_device_state(rng_state)
+
+    def _get_device_state(self) -> torch.Tensor:
         if self._device.type == "hpu":
             self._device_handle.set_rng_ctx("philox")
         rng_state = self._device_handle.get_rng_state().to(self._device)
         if self._device.type == "hpu":
             self._device_handle.unset_rng_ctx("philox")
-        if run_state_sync:
-            # synchronize RNG state using rank 0's current one
-            dist.broadcast(rng_state, 0)
+        return rng_state
 
-        self.rng_states["parallel-rng"] = rng_state.to("cpu")
+    def _set_device_state(self, state: torch.Tensor):
+        if self._device.type == "hpu":
+            self._device_handle.set_rng_ctx("philox")
+        self._device_handle.set_rng_state(state)
+        if self._device.type == "hpu":
+            self._device_handle.unset_rng_ctx("philox")
 
     def _manual_seed(self, parallel_seed: int) -> None:
         self.set_seed("parallel-rng", parallel_seed)
@@ -196,7 +217,6 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
     def _distribute_region(
         self, spec: DTensorSpec, generator: Optional[torch.Generator] = None
     ):
-        g_name = "parallel-rng"
         if generator is not None:
             # This is a little hacky, but for any user-passed generator, we store its state under a unique key,
             # not because we need to keep a copy of it but because its the easiest way to make it work with the
@@ -204,12 +224,10 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
             g_name = "user-passed-generator"
             assert g_name not in self.rng_states
             self.rng_states[g_name] = generator.get_state()
-        # check if the parallel rng state has been synchronized or not
-        if not self.rng_state_is_sync("parallel-rng"):
-            raise RuntimeError(
-                "OffsetBasedRNGTracker requires the random state to be synchronized "
-                "before entering into a distribute region!"
-            )
+        else:
+            g_name = "parallel-rng"
+            assert g_name not in self.rng_states
+            self.rng_states[g_name] = self._get_device_state().to("cpu")
 
         if self.distribute_region_enabled:
             if self._device.type == "hpu":
@@ -236,6 +254,8 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
             # usage of that RNG (dtensor or non-dtensor), (b) drop it from our own cache so that if the user updates
             # the seed value in their rng and uses it with DTensor again, we always use the latest value
             generator.set_state(self.rng_states.pop(g_name))
+        else:
+            self._set_device_state(self.rng_states.pop(g_name))
 
     def get_offset(self, name: str) -> int:
         if name not in self.rng_states:
