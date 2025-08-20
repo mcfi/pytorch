@@ -55,6 +55,9 @@ from . import config
 from .runtime.autotune_cache import AutotuneCacheBundler
 
 
+_graph_execution_order: list[str] = []
+_record_graph_execution: bool = False
+
 if TYPE_CHECKING:
     from collections import Counter
     from collections.abc import Sequence
@@ -581,6 +584,11 @@ class CompiledFxGraph(OutputCode):
 
     def __call__(self, inputs: Sequence[Any]) -> Any:
         assert self.current_callable is not None
+
+        graph_id = self.fx_kwargs.get("graph_id")
+        name = f"graph_{graph_id}" if graph_id is not None else "unknown"
+        if _record_graph_execution:
+            _graph_execution_order.append(name)
         try:
             with record_function(
                 f"## Call CompiledFxGraph {self._fx_graph_cache_key} ##"

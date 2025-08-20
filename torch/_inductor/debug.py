@@ -33,7 +33,7 @@ from torch.types import FileLike
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._pytree import tree_map
 
-from . import config, ir  # noqa: F811, this is needed
+from . import config, ir, output_code  # noqa: F811, this is needed
 from .ir import ExternKernelOut
 from .scheduler import (
     BaseSchedulerNode,
@@ -800,6 +800,34 @@ def log_runtime_and_tensor_meta(node_runtimes: Sequence[tuple[Any, float]]) -> N
         )
     except Exception:
         log.debug("Failed to log inductor_runtime_and_tensor_meta", exc_info=True)
+
+
+def log_graph_execution() -> None:
+    try:
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "inductor_graph_execution",
+                "encoding": "json",
+            },
+            payload_fn=lambda: {
+                "graph_execution": list(output_code._graph_execution_order)
+            },
+        )
+    except Exception:
+        log.debug("Failed to log inductor_graph_execution", exc_info=True)
+
+
+# Minimal user-facing context manager to record execution order and log on exit
+@contextlib.contextmanager
+def record_and_log_graph_execution_order() -> Iterator[None]:
+    output_code._record_graph_execution = True
+    output_code._graph_execution_order.clear()
+    try:
+        yield
+    finally:
+        output_code._record_graph_execution = False
+        log_graph_execution()
 
 
 @dataclasses.dataclass
